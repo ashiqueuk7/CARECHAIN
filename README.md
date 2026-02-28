@@ -207,58 +207,6 @@ http://localhost:8545
 
 ---
 
-## 🧪 Testing Three-Tier Access
-
-### 🏥 Hospital Admin
-- Register hospital
-- Upload patient record
-
-### 👤 Patient
-- Register
-- View records
-- Manage consent
-- View audit logs
-
-### 🧑‍⚕️ Doctor
-- Request access
-- Tier 1: Auto-grant (same hospital)
-- Tier 2: Requires patient consent
-- Tier 3: Emergency time-limited access
-
----
-
-## 📜 Smart Contract Capabilities
-
-- Role Management
-- Hospital Registration
-- IPFS Hash Storage
-- Consent Grant / Revoke
-- Emergency Access (24 hours)
-- Immutable Audit Logs
-
----
-
-## 🔒 Security Design
-
-- AES-256 encryption before IPFS upload
-- No encryption keys stored on blockchain
-- MetaMask wallet-based identity
-- Immutable access logging
-
----
-
-## 🤝 Contributing
-
-```bash
-git checkout -b feature/YourFeature
-git commit -m "Add new feature"
-git push origin feature/YourFeature
-```
-
-Open a Pull Request 🚀
-
----
-
 ## 📄 License
 
 Distributed under the MIT License.
