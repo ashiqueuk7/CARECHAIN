@@ -3,30 +3,46 @@ import { Container, Card, Form, Button, Alert, Spinner, Table } from "react-boot
 import { Link } from "react-router-dom";
 import web3 from "../utils/web3";
 import contract from "../utils/contract";
+import axios from "axios";
 import "../styles/theme.css";
+
+// Helper: hex string → Uint8Array (browser-compatible, no Buffer)
+function hexToBytes(hex) {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+        bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+    }
+    return bytes;
+}
 
 function Stakeholder() {
     const [account, setAccount] = useState("");
     const [userInfo, setUserInfo] = useState(null);
     const [message, setMessage] = useState("");
-    const [loading, setLoading] = useState(false);
 
     // Registration
     const [orgName, setOrgName] = useState("");
-    const [orgType, setOrgType] = useState(""); // "Insurance" or "Research"
+    const [orgType, setOrgType] = useState("");
     const [registering, setRegistering] = useState(false);
 
     // Hospitals and patients
     const [hospitals, setHospitals] = useState([]);
     const [selectedHospital, setSelectedHospital] = useState("");
-    const [patients, setPatients] = useState([]);
+    const [patientsWithNames, setPatientsWithNames] = useState([]);
     const [selectedPatient, setSelectedPatient] = useState(null);
     const [patientRecords, setPatientRecords] = useState([]);
     const [loadingHospitals, setLoadingHospitals] = useState(false);
     const [loadingPatients, setLoadingPatients] = useState(false);
     const [loadingRecords, setLoadingRecords] = useState(false);
 
-    // Load account and check registration
+    // pendingConsentRecords: persistent – records where this stakeholder already
+    // sent a request but the patient hasn't responded yet
+    const [pendingConsentRecords, setPendingConsentRecords] = useState(new Set());
+    // grantedConsentRecords: persistent – records where consent was already given
+    const [grantedConsentRecords, setGrantedConsentRecords] = useState(new Set());
+    // consentTxInFlight: temporary loading indicator while the tx is being sent
+    const [consentTxInFlight, setConsentTxInFlight] = useState(new Set());
+
     useEffect(() => {
         const loadAccount = async () => {
             const accounts = await web3.eth.getAccounts();
@@ -40,7 +56,6 @@ function Stakeholder() {
         }
     }, []);
 
-    // Check registration status
     const checkRegistration = useCallback(async () => {
         if (!account) return;
         try {
@@ -64,7 +79,6 @@ function Stakeholder() {
         checkRegistration();
     }, [checkRegistration]);
 
-    // Fetch hospitals list
     const fetchHospitals = useCallback(async () => {
         setLoadingHospitals(true);
         try {
@@ -82,14 +96,12 @@ function Stakeholder() {
         }
     }, []);
 
-    // If registered as stakeholder, fetch hospitals
     useEffect(() => {
         if (userInfo && userInfo.role === 4) {
             fetchHospitals();
         }
     }, [userInfo, fetchHospitals]);
 
-    // Register stakeholder
     const registerStakeholder = async () => {
         if (!orgName || !orgType) {
             setMessage("Please enter organization name and type");
@@ -111,7 +123,6 @@ function Stakeholder() {
         }
     };
 
-    // Handle hospital selection
     const handleHospitalSelect = async (hospitalId) => {
         setSelectedHospital(hospitalId);
         setSelectedPatient(null);
@@ -119,7 +130,11 @@ function Stakeholder() {
         setLoadingPatients(true);
         try {
             const patientList = await contract.methods.getHospitalPatients(hospitalId).call();
-            setPatients(patientList);
+            const withNames = await Promise.all(patientList.map(async addr => {
+                const user = await contract.methods.users(addr).call();
+                return { addr, name: user.name };
+            }));
+            setPatientsWithNames(withNames);
         } catch (err) {
             console.error("Error fetching patients:", err);
         } finally {
@@ -127,10 +142,12 @@ function Stakeholder() {
         }
     };
 
-    // Handle patient selection
     const handlePatientSelect = async (patientAddr) => {
         setSelectedPatient(patientAddr);
         setLoadingRecords(true);
+        // Clear stale consent state when switching to a new patient
+        setPendingConsentRecords(new Set());
+        setGrantedConsentRecords(new Set());
         try {
             const recordIds = await contract.methods.getPatientRecords(patientAddr).call();
             const records = await Promise.all(recordIds.map(async id => {
@@ -144,6 +161,24 @@ function Stakeholder() {
                 };
             }));
             setPatientRecords(records);
+
+            // Check on-chain consent status for every record so the button
+            // shows the correct persistent state immediately on load.
+            const pending = new Set();
+            const granted = new Set();
+            await Promise.all(records.map(async rec => {
+                const alreadyGranted = await contract.methods.consentGiven(rec.id, account).call();
+                if (alreadyGranted) {
+                    granted.add(rec.id);
+                    return;
+                }
+                const alreadyRequested = await contract.methods.consentRequested(rec.id, account).call();
+                if (alreadyRequested) {
+                    pending.add(rec.id);
+                }
+            }));
+            setPendingConsentRecords(pending);
+            setGrantedConsentRecords(granted);
         } catch (err) {
             setMessage("Error loading records: " + err.message);
         } finally {
@@ -151,20 +186,99 @@ function Stakeholder() {
         }
     };
 
-    // Request access to a record
-    const requestAccess = async (recordId) => {
+    // Download an IPFS record after consent has been granted (Tier 4).
+    // Mirrors the same decrypt-then-download pattern used by Doctor and Hospital.
+    const downloadRecord = async (recordId, ipfsHash) => {
         try {
+            let encryptedResp;
+            try {
+                encryptedResp = await axios.get(`http://localhost:8080/ipfs/${ipfsHash}`, {
+                    responseType: "arraybuffer",
+                    timeout: 5000
+                });
+            } catch (localErr) {
+                console.warn("Local IPFS gateway failed, trying public gateway", localErr);
+                encryptedResp = await axios.get(`https://ipfs.io/ipfs/${ipfsHash}`, {
+                    responseType: "arraybuffer"
+                });
+            }
+            const encryptedData = new Uint8Array(encryptedResp.data);
+
+            const keyResp = await axios.get(`http://localhost:5001/get-key/${recordId}/${account}`);
+            if (!keyResp.data.success) {
+                setMessage("❌ Key retrieval failed: not authorized");
+                return;
+            }
+            const key = hexToBytes(keyResp.data.key);
+
+            const iv = encryptedData.slice(0, 16);
+            const ciphertext = encryptedData.slice(16);
+
+            const cryptoKey = await window.crypto.subtle.importKey(
+                "raw", key, { name: "AES-CBC" }, false, ["decrypt"]
+            );
+            const decrypted = await window.crypto.subtle.decrypt(
+                { name: "AES-CBC", iv }, cryptoKey, ciphertext
+            );
+
+            const blob = new Blob([decrypted]);
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `record_${recordId}.bin`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+            setMessage("✅ File downloaded successfully.");
+        } catch (err) {
+            console.error("Download error:", err);
+            setMessage("Error downloading record: " + err.message);
+        }
+    };
+
+    const requestAccess = async (recordId) => {
+        setConsentTxInFlight(prev => new Set(prev).add(recordId));
+        try {
+            // Client-side pre-checks to avoid wasting gas on obvious failures
+            const alreadyGranted = await contract.methods.consentGiven(recordId, account).call();
+            if (alreadyGranted) {
+                setGrantedConsentRecords(prev => new Set(prev).add(recordId));
+                setMessage("ℹ️ Consent already granted for this record.");
+                return;
+            }
+            const alreadyRequested = await contract.methods.consentRequested(recordId, account).call();
+            if (alreadyRequested) {
+                setPendingConsentRecords(prev => new Set(prev).add(recordId));
+                setMessage("ℹ️ Consent already requested – waiting for patient approval.");
+                return;
+            }
+
             await contract.methods.requestConsent(recordId).send({ from: account, gas: 300000 });
-            setMessage("✅ Access request sent to patient.");
+
+            // Mark as pending persistently so the button stays "⏳ Pending"
+            // even after the component re-renders.
+            setPendingConsentRecords(prev => new Set(prev).add(recordId));
+            setMessage("✅ Access request sent! The patient will see a notification in their dashboard.");
         } catch (err) {
             console.error("Request error:", err);
             let reason = err.message;
             if (err.data && err.data.message) reason = err.data.message;
-            setMessage("❌ Request failed: " + reason);
+            if (reason.includes("Consent already given")) {
+                setGrantedConsentRecords(prev => new Set(prev).add(recordId));
+                setMessage("ℹ️ Consent already granted for this record.");
+            } else {
+                setMessage("❌ Request failed: " + reason);
+            }
+        } finally {
+            setConsentTxInFlight(prev => {
+                const next = new Set(prev);
+                next.delete(recordId);
+                return next;
+            });
         }
     };
 
-    // Render registration form if not registered
     if (!userInfo) {
         return (
             <Container className="mt-4">
@@ -206,7 +320,6 @@ function Stakeholder() {
         );
     }
 
-    // If registered but not stakeholder
     if (userInfo.role !== 4) {
         return (
             <Container className="mt-4">
@@ -216,7 +329,6 @@ function Stakeholder() {
         );
     }
 
-    // Main dashboard
     return (
         <Container className="mt-4">
             <div className="card-custom mb-4">
@@ -248,23 +360,26 @@ function Stakeholder() {
                             <h5 className="mt-4">Patients at this hospital</h5>
                             {loadingPatients ? (
                                 <Spinner size="sm" />
-                            ) : patients.length > 0 ? (
+                            ) : patientsWithNames.length > 0 ? (
                                 <Table striped bordered hover size="sm">
                                     <thead>
                                         <tr>
-                                            <th>Patient Address</th>
+                                            <th>Patient</th>
                                             <th>Action</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {patients.map(addr => (
-                                            <tr key={addr}>
-                                                <td>{addr}</td>
+                                        {patientsWithNames.map(p => (
+                                            <tr key={p.addr}>
+                                                <td>
+                                                    {p.addr}<br/>
+                                                    <small className="text-muted">{p.name}</small>
+                                                </td>
                                                 <td>
                                                     <Button
                                                         size="sm"
                                                         variant="info"
-                                                        onClick={() => handlePatientSelect(addr)}
+                                                        onClick={() => handlePatientSelect(p.addr)}
                                                     >
                                                         View Records
                                                     </Button>
@@ -291,7 +406,7 @@ function Stakeholder() {
                                             <th>ID</th>
                                             <th>Hospital</th>
                                             <th>Timestamp</th>
-                                            <th>Action</th>
+                                            <th>Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody>
@@ -301,13 +416,37 @@ function Stakeholder() {
                                                 <td>{rec.hospitalId}</td>
                                                 <td>{new Date(rec.timestamp * 1000).toLocaleString()}</td>
                                                 <td>
+                                                    {/* Request Access button – disabled once pending or granted */}
                                                     <Button
                                                         size="sm"
-                                                        variant="warning"
+                                                        variant={
+                                                            grantedConsentRecords.has(rec.id) ? "success" :
+                                                            pendingConsentRecords.has(rec.id) ? "secondary" :
+                                                            "warning"
+                                                        }
+                                                        className="me-1"
+                                                        disabled={
+                                                            consentTxInFlight.has(rec.id) ||
+                                                            pendingConsentRecords.has(rec.id) ||
+                                                            grantedConsentRecords.has(rec.id)
+                                                        }
                                                         onClick={() => requestAccess(rec.id)}
                                                     >
-                                                        Request Access
+                                                        {consentTxInFlight.has(rec.id) ? "Sending…" :
+                                                         grantedConsentRecords.has(rec.id) ? "✓ Granted" :
+                                                         pendingConsentRecords.has(rec.id) ? "⏳ Pending" :
+                                                         "Request Access"}
                                                     </Button>
+                                                    {/* Download button – only shown after consent is granted */}
+                                                    {grantedConsentRecords.has(rec.id) && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="primary"
+                                                            onClick={() => downloadRecord(rec.id, rec.ipfsHash)}
+                                                        >
+                                                            Download
+                                                        </Button>
+                                                    )}
                                                 </td>
                                             </tr>
                                         ))}

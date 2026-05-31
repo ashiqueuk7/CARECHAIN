@@ -18,7 +18,7 @@ const ipfs = create({ url: "http://127.0.0.1:5002" });
 
 // Blockchain connection
 const web3 = new Web3("http://127.0.0.1:8545"); // Ganache
-const contractAddress = "0x54672a239f4a1488C4668eF59d242c0fcFF965e9"; // <-- REPLACE with your deployed contract address
+const contractAddress = "0x70332dc0812F00EAb2Bb91c8434aeF4a80e78C25"; // <-- REPLACE with your deployed contract address
 
 let abi = contractABI.abi || contractABI;
 const contract = new web3.eth.Contract(abi, contractAddress);

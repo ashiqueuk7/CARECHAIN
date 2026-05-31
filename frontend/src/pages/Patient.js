@@ -30,7 +30,8 @@ function Patient() {
     const [loadingHospitals, setLoadingHospitals] = useState(false);
 
     // Notifications
-    const [consentRequests, setConsentRequests] = useState([]);
+    const [consentRequests, setConsentRequests] = useState([]); // { recordId, requester, requesterName, roleName }
+    const [grantedConsents, setGrantedConsents] = useState([]); // { recordId, grantee, granteeName, roleName }
     const [emergencyAccesses, setEmergencyAccesses] = useState([]);
     const [loadingNotifications, setLoadingNotifications] = useState(false);
 
@@ -95,15 +96,25 @@ function Patient() {
         if (userInfo && userInfo.role === 1) {
             loadPatientRecords();
             loadNotifications();
-            // Poll for new notifications every 10 seconds
             const interval = setInterval(() => {
                 loadNotifications();
             }, 10000);
             return () => clearInterval(interval);
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [userInfo]);
 
     // Load notifications (consent requests and emergency accesses)
+    //
+    // FIX: The previous implementation passed recordId hex values as an event
+    // filter. Web3 indexed-event filters require 32-byte padded hex strings,
+    // but web3.utils.numberToHex() produces un-padded values (e.g. "0x1"),
+    // so the filter silently returned no events.
+    //
+    // Solution: fetch ALL past events for the relevant topics and filter
+    // client-side by comparing the numeric recordId against the patient's
+    // own record list. This is reliable regardless of hex formatting.
+    //
     const loadNotifications = async () => {
         if (!userInfo || userInfo.role !== 1) return;
         setLoadingNotifications(true);
@@ -113,41 +124,97 @@ function Patient() {
             const emergencies = [];
 
             if (recordIds.length > 0) {
-                const recordHexIds = recordIds.map(id => web3.utils.numberToHex(id));
+                // Build a Set of the patient's record IDs (as numbers) for O(1) lookup
+                const myRecordIdSet = new Set(recordIds.map(id => Number(id)));
 
-                // Fetch ConsentRequested events
+                // Fetch ALL ConsentRequested events – filter client-side
                 const consentEvents = await contract.getPastEvents("ConsentRequested", {
-                    filter: { recordId: recordHexIds },
                     fromBlock: 0,
                     toBlock: "latest"
                 });
+
                 for (const event of consentEvents) {
-                    const { recordId, doctor } = event.returnValues;
-                    // Check if consent not already given
-                    const consentGiven = await contract.methods.consentGiven(recordId, doctor).call();
-                    if (!consentGiven) {
-                        requests.push({ recordId: Number(recordId), doctor });
-                    }
+                    const { recordId, requester } = event.returnValues;
+                    const recordIdNum = Number(recordId);
+
+                    // Only care about records that belong to this patient
+                    if (!myRecordIdSet.has(recordIdNum)) continue;
+
+                    // Skip if consent was already granted
+                    const alreadyGranted = await contract.methods.consentGiven(recordId, requester).call();
+                    if (alreadyGranted) continue;
+
+                    // Fetch requester info for display
+                    const requesterUser = await contract.methods.users(requester).call();
+                    const requesterName = requesterUser.registered ? requesterUser.name : "Unknown";
+                    const roleNum = Number(requesterUser.role);
+                    const roleName = roleNum === 2 ? "Doctor" : (roleNum === 4 ? "Stakeholder" : "Unknown");
+
+                    requests.push({
+                        recordId: recordIdNum,
+                        requester,
+                        requesterName,
+                        roleName
+                    });
                 }
 
-                // Fetch EmergencyAccessGranted events
+                // Fetch ALL EmergencyAccessGranted events – filter client-side
                 const emergencyEvents = await contract.getPastEvents("EmergencyAccessGranted", {
-                    filter: { recordId: recordHexIds },
                     fromBlock: 0,
                     toBlock: "latest"
                 });
+
                 for (const event of emergencyEvents) {
                     const { doctor, recordId, expiry } = event.returnValues;
+                    const recordIdNum = Number(recordId);
+
+                    // Only care about records that belong to this patient
+                    if (!myRecordIdSet.has(recordIdNum)) continue;
+
                     const expiryNum = Number(expiry);
-                    // Only show if still active
-                    if (expiryNum > Math.floor(Date.now() / 1000)) {
-                        emergencies.push({
-                            recordId: Number(recordId),
-                            doctor,
-                            expiry: expiryNum
-                        });
-                    }
+                    // Only show still-active emergency accesses
+                    if (expiryNum <= Math.floor(Date.now() / 1000)) continue;
+
+                    // Verify on-chain that the emergency access is still live
+                    const liveExpiry = await contract.methods.emergencyAccess(doctor, recordId).call();
+                    if (Number(liveExpiry) <= Math.floor(Date.now() / 1000)) continue;
+
+                    const doctorUser = await contract.methods.users(doctor).call();
+                    const doctorName = doctorUser.registered ? doctorUser.name : "Unknown";
+
+                    emergencies.push({
+                        recordId: recordIdNum,
+                        doctor,
+                        doctorName,
+                        expiry: expiryNum
+                    });
                 }
+                // ── Tier 2 – currently active granted consents (doctors & stakeholders) ──
+                // Fetch ConsentGiven events then verify consent is still active
+                // (patient may have revoked it, setting consentGiven back to false).
+                const consentGivenEvents = await contract.getPastEvents("ConsentGiven", {
+                    fromBlock: 0,
+                    toBlock: "latest"
+                });
+                const granted = [];
+                const seen = new Set(); // deduplicate (recordId, grantee)
+                for (const event of consentGivenEvents) {
+                    const { recordId, grantee } = event.returnValues;
+                    const recordIdNum = Number(recordId);
+                    if (!myRecordIdSet.has(recordIdNum)) continue;
+                    const key = `${recordIdNum}-${grantee}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    // Verify still active on-chain
+                    const stillActive = await contract.methods.consentGiven(recordId, grantee).call();
+                    if (!stillActive) continue;
+                    const granteeUser = await contract.methods.users(grantee).call();
+                    const granteeName = granteeUser.registered ? granteeUser.name : "Unknown";
+                    const roleNum = Number(granteeUser.role);
+                    const roleName = roleNum === 2 ? "Doctor" : (roleNum === 4 ? "Stakeholder" : "Unknown");
+                    granted.push({ recordId: recordIdNum, grantee, granteeName, roleName });
+                }
+                setGrantedConsents(granted);
             }
 
             setConsentRequests(requests);
@@ -201,24 +268,37 @@ function Patient() {
         }
     };
 
-    // View access logs with doctor names
+    // Human-readable tier labels for access log display
+    const tierLabel = (tier) => {
+        switch (tier) {
+            case 1: return "Tier 1 – Same Hospital";
+            case 2: return "Tier 2 – Explicit Consent";
+            case 3: return "Tier 3 – Emergency";
+            case 5: return "Tier 5 – Consent Revoked";
+            default: return `Tier ${tier}`;
+        }
+    };
+
+    // View access logs with names
     const viewLogs = async (recordId) => {
         try {
             const logs = await contract.methods.getAccessLogs(recordId).call();
             const enhanced = await Promise.all(logs.map(async log => {
-                const doctor = log.accessor;
-                const user = await contract.methods.users(doctor).call();
-                const doctorName = user.registered ? user.name : "Unknown";
+                const accessor = log.accessor;
+                const user = await contract.methods.users(accessor).call();
+                const accessorName = user.registered ? user.name : "Unknown";
                 let hospitalName = "";
                 if (user.registered && (Number(user.role) === 2 || Number(user.role) === 3)) {
                     const hospital = await contract.methods.hospitals(user.hospitalId).call();
                     hospitalName = hospital.name;
+                } else if (user.registered && Number(user.role) === 4) {
+                    hospitalName = "Stakeholder";
                 }
                 return {
-                    accessor: doctor,
+                    accessor,
                     tier: Number(log.tier),
                     time: Number(log.time),
-                    doctorName,
+                    accessorName,
                     hospitalName
                 };
             }));
@@ -287,14 +367,25 @@ function Patient() {
         }
     };
 
-    // Give consent (Tier 2)
-    const giveConsent = async (recordId, doctor) => {
+    // Give consent (Tier 2 – explicit consent for doctors & stakeholders)
+    const giveConsent = async (recordId, grantee) => {
         try {
-            await contract.methods.giveConsent(recordId, doctor).send({ from: account });
-            setMessage(`✅ Consent given to ${doctor} for record ${recordId}`);
-            setConsentRequests(prev => prev.filter(req => !(req.recordId === recordId && req.doctor === doctor)));
+            await contract.methods.giveConsent(recordId, grantee).send({ from: account });
+            setMessage(`✅ Consent given to ${grantee}`);
+            setConsentRequests(prev => prev.filter(req => !(req.recordId === recordId && req.requester === grantee)));
         } catch (err) {
             setMessage("Error giving consent: " + err.message);
+        }
+    };
+
+    // Revoke granted consent (Tier 2)
+    const revokeConsent = async (recordId, grantee) => {
+        try {
+            await contract.methods.revokeConsent(recordId, grantee).send({ from: account });
+            setMessage(`✅ Consent revoked for ${grantee}`);
+            setGrantedConsents(prev => prev.filter(g => !(g.recordId === recordId && g.grantee === grantee)));
+        } catch (err) {
+            setMessage("Error revoking consent: " + err.message);
         }
     };
 
@@ -302,7 +393,7 @@ function Patient() {
     const revokeEmergency = async (recordId, doctor) => {
         try {
             await contract.methods.revokeEmergencyAccess(recordId, doctor).send({ from: account });
-            setMessage(`✅ Emergency access revoked for ${doctor} on record ${recordId}`);
+            setMessage(`✅ Emergency access revoked for ${doctor}`);
             setEmergencyAccesses(prev => prev.filter(em => !(em.recordId === recordId && em.doctor === doctor)));
         } catch (err) {
             setMessage("Error revoking: " + err.message);
@@ -412,9 +503,9 @@ function Patient() {
                             <Table size="sm" striped bordered>
                                 <thead>
                                     <tr>
-                                        <th>Doctor Address</th>
-                                        <th>Doctor Name</th>
-                                        <th>Hospital</th>
+                                        <th>Accessor Address</th>
+                                        <th>Name</th>
+                                        <th>Hospital / Type</th>
                                         <th>Tier</th>
                                         <th>Time</th>
                                     </tr>
@@ -423,9 +514,9 @@ function Patient() {
                                     {logs.map((log, idx) => (
                                         <tr key={idx}>
                                             <td>{log.accessor}</td>
-                                            <td>{log.doctorName}</td>
+                                            <td>{log.accessorName}</td>
                                             <td>{log.hospitalName}</td>
-                                            <td>{log.tier}</td>
+                                            <td>{tierLabel(log.tier)}</td>
                                             <td>{new Date(log.time * 1000).toLocaleString()}</td>
                                         </tr>
                                     ))}
@@ -449,16 +540,18 @@ function Patient() {
                         </Button>
                     </div>
 
-                    {/* Consent Requests (Tier 2) */}
+                    {/* Consent Requests (Tier 2 – doctors & stakeholders) */}
                     {consentRequests.length > 0 && (
                         <Card className="card-custom mb-3">
                             <Card.Body>
-                                <Card.Title>Pending Consent Requests (Tier 2)</Card.Title>
+                                <Card.Title>Pending Consent Requests</Card.Title>
                                 <Table striped bordered hover size="sm">
                                     <thead>
                                         <tr>
                                             <th>Record ID</th>
-                                            <th>Requester Address</th>
+                                            <th>Requester</th>
+                                            <th>Name</th>
+                                            <th>Role</th>
                                             <th>Action</th>
                                         </tr>
                                     </thead>
@@ -466,15 +559,57 @@ function Patient() {
                                         {consentRequests.map((req, idx) => (
                                             <tr key={idx}>
                                                 <td>{req.recordId}</td>
-                                                <td>{req.doctor}</td>
+                                                <td>{req.requester}</td>
+                                                <td>{req.requesterName}</td>
+                                                <td>{req.roleName}</td>
                                                 <td>
                                                     <Button
                                                         size="sm"
                                                         variant="success"
                                                         className="btn-medical"
-                                                        onClick={() => giveConsent(req.recordId, req.doctor)}
+                                                        onClick={() => giveConsent(req.recordId, req.requester)}
                                                     >
                                                         Grant Consent
+                                                    </Button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </Table>
+                            </Card.Body>
+                        </Card>
+                    )}
+
+                    {/* Granted Consents (Tier 2 – doctors & stakeholders) – with Revoke */}
+                    {grantedConsents.length > 0 && (
+                        <Card className="card-custom mb-3">
+                            <Card.Body>
+                                <Card.Title>Active Granted Consents</Card.Title>
+                                <Table striped bordered hover size="sm">
+                                    <thead>
+                                        <tr>
+                                            <th>Record ID</th>
+                                            <th>Grantee</th>
+                                            <th>Name</th>
+                                            <th>Role</th>
+                                            <th>Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {grantedConsents.map((g, idx) => (
+                                            <tr key={idx}>
+                                                <td>{g.recordId}</td>
+                                                <td>{g.grantee}</td>
+                                                <td>{g.granteeName}</td>
+                                                <td>{g.roleName}</td>
+                                                <td>
+                                                    <Button
+                                                        size="sm"
+                                                        variant="danger"
+                                                        className="btn-medical"
+                                                        onClick={() => revokeConsent(g.recordId, g.grantee)}
+                                                    >
+                                                        Revoke Consent
                                                     </Button>
                                                 </td>
                                             </tr>
@@ -489,12 +624,13 @@ function Patient() {
                     {emergencyAccesses.length > 0 && (
                         <Card className="card-custom mb-3">
                             <Card.Body>
-                                <Card.Title>Active Emergency Accesses (Tier 3)</Card.Title>
+                                <Card.Title>Active Emergency Accesses</Card.Title>
                                 <Table striped bordered hover size="sm">
                                     <thead>
                                         <tr>
                                             <th>Record ID</th>
-                                            <th>Doctor Address</th>
+                                            <th>Doctor</th>
+                                            <th>Name</th>
                                             <th>Expires</th>
                                             <th>Action</th>
                                         </tr>
@@ -504,6 +640,7 @@ function Patient() {
                                             <tr key={idx}>
                                                 <td>{em.recordId}</td>
                                                 <td>{em.doctor}</td>
+                                                <td>{em.doctorName}</td>
                                                 <td>{new Date(em.expiry * 1000).toLocaleString()}</td>
                                                 <td>
                                                     <Button
@@ -523,7 +660,7 @@ function Patient() {
                         </Card>
                     )}
 
-                    {consentRequests.length === 0 && emergencyAccesses.length === 0 && (
+                    {consentRequests.length === 0 && emergencyAccesses.length === 0 && grantedConsents.length === 0 && (
                         <p>No pending notifications.</p>
                     )}
                 </Tab>

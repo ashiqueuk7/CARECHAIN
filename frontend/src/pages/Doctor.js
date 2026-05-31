@@ -5,7 +5,6 @@ import contract from "../utils/contract";
 import axios from "axios";
 import "../styles/theme.css";
 
-// Helper: convert hex string to Uint8Array (browser-compatible)
 function hexToBytes(hex) {
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < hex.length; i += 2) {
@@ -27,8 +26,8 @@ function Doctor() {
     const [hospitals, setHospitals] = useState([]);
     const [loadingHospitals, setLoadingHospitals] = useState(false);
 
-    // Patients at own hospital
-    const [ownHospitalPatients, setOwnHospitalPatients] = useState([]);
+    // Patients at own hospital (with names)
+    const [ownPatientsWithNames, setOwnPatientsWithNames] = useState([]);
     const [selectedOwnPatient, setSelectedOwnPatient] = useState(null);
     const [ownPatientRecords, setOwnPatientRecords] = useState([]);
     const [loadingOwnPatients, setLoadingOwnPatients] = useState(false);
@@ -38,11 +37,21 @@ function Doctor() {
     // Other hospitals
     const [otherHospitals, setOtherHospitals] = useState([]);
     const [selectedOtherHospital, setSelectedOtherHospital] = useState("");
-    const [otherHospitalPatients, setOtherHospitalPatients] = useState([]);
+    const [otherPatientsWithNames, setOtherPatientsWithNames] = useState([]);
     const [selectedOtherPatient, setSelectedOtherPatient] = useState(null);
     const [otherPatientRecords, setOtherPatientRecords] = useState([]);
     const [loadingOtherPatients, setLoadingOtherPatients] = useState(false);
     const [loadingOtherRecords, setLoadingOtherRecords] = useState(false);
+
+    // requestedEmergency: in-flight loading indicator (cleared after tx)
+    const [requestedEmergency, setRequestedEmergency] = useState(new Set());
+    // pendingConsentRecords: persistent – records where this doctor already sent
+    // a consent request but the patient hasn't responded yet
+    const [pendingConsentRecords, setPendingConsentRecords] = useState(new Set());
+    // grantedConsentRecords: persistent – records where consent was already given
+    const [grantedConsentRecords, setGrantedConsentRecords] = useState(new Set());
+    // consentTxInFlight: temporary loading indicator while tx is being sent
+    const [consentTxInFlight, setConsentTxInFlight] = useState(new Set());
 
     // Fetch hospitals list
     const fetchHospitals = useCallback(async () => {
@@ -73,7 +82,6 @@ function Doctor() {
                     role: Number(user.role),
                     hospitalId: Number(user.hospitalId)
                 });
-                // Fetch hospital name
                 if (Number(user.hospitalId) > 0) {
                     const hospital = await contract.methods.hospitals(user.hospitalId).call();
                     setHospitalName(hospital.name);
@@ -107,14 +115,18 @@ function Doctor() {
         checkRegistration();
     }, [checkRegistration]);
 
-    // If registered as doctor, fetch own hospital patients
+    // Fetch own hospital patients and their names
     useEffect(() => {
         if (!userInfo || userInfo.role !== 2) return;
         const fetchOwnPatients = async () => {
             setLoadingOwnPatients(true);
             try {
                 const patientList = await contract.methods.getHospitalPatients(userInfo.hospitalId).call();
-                setOwnHospitalPatients(patientList);
+                const withNames = await Promise.all(patientList.map(async addr => {
+                    const user = await contract.methods.users(addr).call();
+                    return { addr, name: user.name };
+                }));
+                setOwnPatientsWithNames(withNames);
             } catch (err) {
                 console.error("Error fetching own hospital patients:", err);
             } finally {
@@ -124,7 +136,7 @@ function Doctor() {
         fetchOwnPatients();
     }, [userInfo]);
 
-    // Filter other hospitals (exclude own)
+    // Filter other hospitals
     useEffect(() => {
         if (userInfo && hospitals.length > 0) {
             setOtherHospitals(hospitals.filter(h => h.id !== userInfo.hospitalId));
@@ -139,7 +151,6 @@ function Doctor() {
         setSelectedPatientDetails(null);
         setLoadingOwnRecords(true);
         try {
-            // Fetch patient details (name, age, gender)
             const patientUser = await contract.methods.users(patientAddr).call();
             setSelectedPatientDetails({
                 name: patientUser.name,
@@ -147,7 +158,6 @@ function Doctor() {
                 gender: patientUser.gender
             });
 
-            // Fetch records
             const recordIds = await contract.methods.getPatientRecords(patientAddr).call();
             const records = await Promise.all(recordIds.map(async id => {
                 const idNum = Number(id);
@@ -167,9 +177,11 @@ function Doctor() {
         }
     };
 
-    // Download record
+    // Download record (with access logging)
     const downloadRecord = async (recordId, ipfsHash) => {
         try {
+            await contract.methods.accessRecord(recordId).send({ from: account, gas: 300000 });
+
             let encryptedResp;
             try {
                 encryptedResp = await axios.get(`http://localhost:8080/ipfs/${ipfsHash}`, {
@@ -234,7 +246,11 @@ function Doctor() {
         setLoadingOtherPatients(true);
         try {
             const patientList = await contract.methods.getHospitalPatients(hospitalId).call();
-            setOtherHospitalPatients(patientList);
+            const withNames = await Promise.all(patientList.map(async addr => {
+                const user = await contract.methods.users(addr).call();
+                return { addr, name: user.name };
+            }));
+            setOtherPatientsWithNames(withNames);
         } catch (err) {
             console.error("Error fetching other hospital patients:", err);
         } finally {
@@ -242,70 +258,92 @@ function Doctor() {
         }
     };
 
-    // Request consent with pre‑checks and better error handling
+    // Request consent – uses separate in-flight vs persistent state so the
+    // button stays disabled with "Pending" even after the tx completes.
     const requestConsent = async (recordId) => {
+        setConsentTxInFlight(prev => new Set(prev).add(recordId));
         try {
-            // Pre‑checks to avoid unnecessary transaction and provide immediate feedback
+            // Client-side pre-checks (saves gas on obvious failures)
             const record = await contract.methods.records(recordId).call();
             if (!record || Number(record.id) === 0) {
                 setMessage("❌ Record does not exist.");
                 return;
             }
-            const consentGiven = await contract.methods.consentGiven(recordId, account).call();
-            if (consentGiven) {
-                setMessage("❌ Consent already given for this record.");
+            const alreadyGranted = await contract.methods.consentGiven(recordId, account).call();
+            if (alreadyGranted) {
+                setGrantedConsentRecords(prev => new Set(prev).add(recordId));
+                setMessage("ℹ️ Consent already granted for this record.");
                 return;
             }
-            const emergencyActive = await contract.methods.emergencyAccess(account, recordId).call();
-            if (Number(emergencyActive) > Math.floor(Date.now() / 1000)) {
-                setMessage("❌ Emergency access is already active.");
+            const alreadyRequested = await contract.methods.consentRequested(recordId, account).call();
+            if (alreadyRequested) {
+                setPendingConsentRecords(prev => new Set(prev).add(recordId));
+                setMessage("ℹ️ Consent already requested – waiting for patient approval.");
+                return;
+            }
+            const emergencyExpiry = await contract.methods.emergencyAccess(account, recordId).call();
+            if (Number(emergencyExpiry) > Math.floor(Date.now() / 1000)) {
+                setMessage("❌ Emergency access is still active. It will expire automatically.");
                 return;
             }
 
-            // If all pre‑checks pass, send the transaction
             await contract.methods.requestConsent(recordId).send({ from: account, gas: 300000 });
-            setMessage("✅ Consent request sent to patient.");
+
+            // Mark as pending persistently so the button stays "Pending" even
+            // after the page re-renders without needing another blockchain read.
+            setPendingConsentRecords(prev => new Set(prev).add(recordId));
+            setMessage("✅ Consent request sent! The patient will see a notification in their dashboard.");
         } catch (err) {
             console.error("Full error object:", err);
-
-            // Try to extract revert reason
             let reason = "Unknown error";
             if (err.data && err.data.message) {
                 reason = err.data.message;
             } else if (err.message) {
                 const match = err.message.match(/revert\s+(.*?)(\s+at|$)/i);
-                if (match) reason = match[1];
-                else reason = err.message;
+                reason = match ? match[1] : err.message;
             }
-
-            // Known reasons
-            if (reason.includes("Record does not exist")) {
-                setMessage("❌ Record does not exist.");
-            } else if (reason.includes("Consent already given")) {
-                setMessage("❌ Consent already given for this record.");
+            if (reason.includes("Consent already given")) {
+                setGrantedConsentRecords(prev => new Set(prev).add(recordId));
+                setMessage("ℹ️ Consent already granted for this record.");
             } else if (reason.includes("Emergency access already active")) {
-                setMessage("❌ Emergency access is already active.");
+                setMessage("❌ Emergency access is still active for this record.");
             } else {
                 setMessage("❌ Error requesting consent: " + reason);
             }
+        } finally {
+            setConsentTxInFlight(prev => {
+                const next = new Set(prev);
+                next.delete(recordId);
+                return next;
+            });
         }
     };
 
-    // Emergency access
+    // Emergency access with button disabling
     const requestEmergencyAccess = async (recordId) => {
+        setRequestedEmergency(prev => new Set(prev).add(recordId));
         try {
             await contract.methods.requestEmergencyAccess(recordId).send({ from: account, gas: 300000 });
             setMessage("✅ Emergency access granted for 24 hours. You can now download the record.");
         } catch (err) {
             console.error("Emergency access error:", err);
             setMessage("Error: " + err.message);
+        } finally {
+            setRequestedEmergency(prev => {
+                const newSet = new Set(prev);
+                newSet.delete(recordId);
+                return newSet;
+            });
         }
     };
 
-    // Fetch records for selected other patient
+    // Fetch records for selected other patient + check consent status for each
     const handleOtherPatientSelect = async (patientAddr) => {
         setSelectedOtherPatient(patientAddr);
         setLoadingOtherRecords(true);
+        // Clear stale consent state whenever a new patient is selected
+        setPendingConsentRecords(new Set());
+        setGrantedConsentRecords(new Set());
         try {
             const recordIds = await contract.methods.getPatientRecords(patientAddr).call();
             const records = await Promise.all(recordIds.map(async id => {
@@ -319,6 +357,25 @@ function Doctor() {
                 };
             }));
             setOtherPatientRecords(records);
+
+            // For each record, check on-chain whether this doctor has already
+            // requested consent or been granted consent, so buttons show the
+            // correct persistent state immediately on load.
+            const pending = new Set();
+            const granted = new Set();
+            await Promise.all(records.map(async rec => {
+                const alreadyGranted = await contract.methods.consentGiven(rec.id, account).call();
+                if (alreadyGranted) {
+                    granted.add(rec.id);
+                    return;
+                }
+                const alreadyRequested = await contract.methods.consentRequested(rec.id, account).call();
+                if (alreadyRequested) {
+                    pending.add(rec.id);
+                }
+            }));
+            setPendingConsentRecords(pending);
+            setGrantedConsentRecords(granted);
         } catch (err) {
             setMessage("Error loading records: " + err.message);
         } finally {
@@ -326,7 +383,7 @@ function Doctor() {
         }
     };
 
-    // Registration function
+    // Registration
     const registerDoctor = async () => {
         if (!doctorName || !selectedHospitalId) {
             setMessage("Please enter name and select hospital");
@@ -404,7 +461,6 @@ function Doctor() {
         );
     }
 
-    // If registered but not doctor
     if (userInfo.role !== 2) {
         return (
             <Container className="mt-4">
@@ -415,7 +471,7 @@ function Doctor() {
         );
     }
 
-    // Main dashboard with tabs
+    // Main dashboard
     return (
         <Container className="mt-4">
             <div className="card-custom mb-4">
@@ -433,22 +489,25 @@ function Doctor() {
                                 <Card.Title>Patients at your hospital</Card.Title>
                                 {loadingOwnPatients ? (
                                     <Spinner animation="border" size="sm" />
-                                ) : ownHospitalPatients.length > 0 ? (
+                                ) : ownPatientsWithNames.length > 0 ? (
                                     <Table striped bordered hover size="sm">
                                         <thead>
-                                            <tr><th>Patient Address</th><th>Action</th></tr>
+                                            <tr><th>Patient</th><th>Action</th></tr>
                                         </thead>
                                         <tbody>
-                                            {ownHospitalPatients.map(addr => (
-                                                <tr key={addr}>
-                                                    <td>{addr}</td>
+                                            {ownPatientsWithNames.map(p => (
+                                                <tr key={p.addr}>
+                                                    <td>
+                                                        {p.addr}<br/>
+                                                        <small className="text-muted">{p.name}</small>
+                                                    </td>
                                                     <td>
                                                         <Button
                                                             size="sm"
-                                                            variant={selectedOwnPatient === addr ? "success" : "primary"}
-                                                            onClick={() => handleOwnPatientSelect(addr)}
+                                                            variant={selectedOwnPatient === p.addr ? "success" : "primary"}
+                                                            onClick={() => handleOwnPatientSelect(p.addr)}
                                                         >
-                                                            {selectedOwnPatient === addr ? "Selected" : "View Records"}
+                                                            {selectedOwnPatient === p.addr ? "Selected" : "View Records"}
                                                         </Button>
                                                     </td>
                                                 </tr>
@@ -531,20 +590,23 @@ function Doctor() {
                                         <h5 className="mt-3">Patients at this hospital</h5>
                                         {loadingOtherPatients ? (
                                             <Spinner size="sm" />
-                                        ) : otherHospitalPatients.length > 0 ? (
+                                        ) : otherPatientsWithNames.length > 0 ? (
                                             <Table striped bordered hover size="sm">
                                                 <thead>
-                                                    <tr><th>Patient Address</th><th>Action</th></tr>
+                                                    <tr><th>Patient</th><th>Action</th></tr>
                                                 </thead>
                                                 <tbody>
-                                                    {otherHospitalPatients.map(addr => (
-                                                        <tr key={addr}>
-                                                            <td>{addr}</td>
+                                                    {otherPatientsWithNames.map(p => (
+                                                        <tr key={p.addr}>
+                                                            <td>
+                                                                {p.addr}<br/>
+                                                                <small className="text-muted">{p.name}</small>
+                                                            </td>
                                                             <td>
                                                                 <Button
                                                                     size="sm"
                                                                     variant="info"
-                                                                    onClick={() => handleOtherPatientSelect(addr)}
+                                                                    onClick={() => handleOtherPatientSelect(p.addr)}
                                                                 >
                                                                     View Records
                                                                 </Button>
@@ -581,19 +643,32 @@ function Doctor() {
                                                                     <td>
                                                                         <Button
                                                                             size="sm"
-                                                                            variant="warning"
+                                                                            variant={
+                                                                                grantedConsentRecords.has(rec.id) ? "success" :
+                                                                                pendingConsentRecords.has(rec.id) ? "secondary" :
+                                                                                "warning"
+                                                                            }
                                                                             className="me-1"
+                                                                            disabled={
+                                                                                consentTxInFlight.has(rec.id) ||
+                                                                                pendingConsentRecords.has(rec.id) ||
+                                                                                grantedConsentRecords.has(rec.id)
+                                                                            }
                                                                             onClick={() => requestConsent(rec.id)}
                                                                         >
-                                                                            Request Consent
+                                                                            {consentTxInFlight.has(rec.id) ? "Sending…" :
+                                                                             grantedConsentRecords.has(rec.id) ? "✓ Granted" :
+                                                                             pendingConsentRecords.has(rec.id) ? "⏳ Pending" :
+                                                                             "Request Consent"}
                                                                         </Button>
                                                                         <Button
                                                                             size="sm"
                                                                             variant="danger"
                                                                             className="me-1"
+                                                                            disabled={requestedEmergency.has(rec.id)}
                                                                             onClick={() => requestEmergencyAccess(rec.id)}
                                                                         >
-                                                                            Emergency Access
+                                                                            {requestedEmergency.has(rec.id) ? "Requested" : "Emergency Access"}
                                                                         </Button>
                                                                         <Button
                                                                             size="sm"

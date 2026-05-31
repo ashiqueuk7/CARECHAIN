@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import { Container, Form, Button, Alert, Card, Table, Spinner } from "react-bootstrap";
 import contract from "../utils/contract";
 import axios from "axios";
-import "../styles/theme.css"; // Apply custom light theme
+import "../styles/theme.css";
 
 // Helper: convert hex string to Uint8Array (browser-compatible)
 function hexToBytes(hex) {
@@ -18,15 +18,14 @@ function Hospital() {
     const [userInfo, setUserInfo] = useState(null);
     const [hospitalName, setHospitalName] = useState("");
     const [selectedPatient, setSelectedPatient] = useState("");
+    const [selectedPatientDetails, setSelectedPatientDetails] = useState(null);
     const [file, setFile] = useState(null);
     const [message, setMessage] = useState("");
     const [isUploading, setIsUploading] = useState(false);
     const [newHospitalName, setNewHospitalName] = useState("");
     const [loading, setLoading] = useState(false);
-    const [patients, setPatients] = useState([]);
+    const [patients, setPatients] = useState([]); // array of { addr, name }
     const [loadingPatients, setLoadingPatients] = useState(false);
-    
-    // New state for patient records
     const [patientRecords, setPatientRecords] = useState([]);
     const [loadingRecords, setLoadingRecords] = useState(false);
 
@@ -78,7 +77,7 @@ function Hospital() {
         checkRegistration(account);
     }, [account, checkRegistration]);
 
-    // Fetch patients for this hospital (using the new mapping)
+    // Fetch patients for this hospital with names
     useEffect(() => {
         if (!userInfo || userInfo.role !== 3) {
             setPatients([]);
@@ -89,7 +88,11 @@ function Hospital() {
             try {
                 const hospitalId = userInfo.hospitalId;
                 const patientList = await contract.methods.getHospitalPatients(hospitalId).call();
-                setPatients(patientList);
+                const patientsWithNames = await Promise.all(patientList.map(async (addr) => {
+                    const user = await contract.methods.users(addr).call();
+                    return { addr, name: user.name };
+                }));
+                setPatients(patientsWithNames);
             } catch (err) {
                 console.error("Error fetching patients:", err);
                 setMessage("Error loading patients for this hospital.");
@@ -100,15 +103,25 @@ function Hospital() {
         fetchPatientsForHospital();
     }, [userInfo]);
 
-    // Fetch records of selected patient
+    // Fetch records of selected patient and patient details
     useEffect(() => {
         if (!selectedPatient || !userInfo || userInfo.role !== 3) {
             setPatientRecords([]);
+            setSelectedPatientDetails(null);
             return;
         }
-        const fetchPatientRecords = async () => {
+        const fetchPatientDetailsAndRecords = async () => {
             setLoadingRecords(true);
             try {
+                // Fetch patient details
+                const patientUser = await contract.methods.users(selectedPatient).call();
+                setSelectedPatientDetails({
+                    name: patientUser.name,
+                    age: Number(patientUser.age),
+                    gender: patientUser.gender
+                });
+
+                // Fetch records
                 const recordIds = await contract.methods.getPatientRecords(selectedPatient).call();
                 const recordsData = await Promise.all(recordIds.map(async (id) => {
                     const idNum = Number(id);
@@ -122,13 +135,13 @@ function Hospital() {
                 }));
                 setPatientRecords(recordsData);
             } catch (err) {
-                console.error("Error fetching patient records:", err);
-                setMessage("Error loading patient records.");
+                console.error("Error fetching patient data:", err);
+                setMessage("Error loading patient data.");
             } finally {
                 setLoadingRecords(false);
             }
         };
-        fetchPatientRecords();
+        fetchPatientDetailsAndRecords();
     }, [selectedPatient, userInfo]);
 
     // Register a new hospital
@@ -181,8 +194,17 @@ function Hospital() {
             await axios.post("http://localhost:5001/associate-key", { ipfsHash, recordId });
 
             setMessage(`✅ Record uploaded successfully. Record ID: ${recordId}`);
-            setPatients(prev => prev.includes(selectedPatient) ? prev : [...prev, selectedPatient]);
-            // Refresh records list after upload
+
+            // Refresh patients list (in case this patient was new)
+            const hospitalId = userInfo.hospitalId;
+            const patientList = await contract.methods.getHospitalPatients(hospitalId).call();
+            const patientsWithNames = await Promise.all(patientList.map(async (addr) => {
+                const user = await contract.methods.users(addr).call();
+                return { addr, name: user.name };
+            }));
+            setPatients(patientsWithNames);
+
+            // Refresh records for selected patient
             const recordIds = await contract.methods.getPatientRecords(selectedPatient).call();
             const recordsData = await Promise.all(recordIds.map(async (id) => {
                 const idNum = Number(id);
@@ -206,7 +228,6 @@ function Hospital() {
     // Download a record
     const downloadRecord = async (recordId, ipfsHash) => {
         try {
-            // Fetch encrypted data from IPFS (includes IV at beginning)
             let encryptedResp;
             try {
                 encryptedResp = await axios.get(`http://localhost:8080/ipfs/${ipfsHash}`, {
@@ -221,21 +242,17 @@ function Hospital() {
             }
             const encryptedData = new Uint8Array(encryptedResp.data);
 
-            // Get decryption key from backend
             const keyResp = await axios.get(`http://localhost:5001/get-key/${recordId}/${account}`);
             if (!keyResp.data.success) {
                 setMessage("Key retrieval failed: not authorized");
                 return;
             }
             const keyHex = keyResp.data.key;
-            // Replace Buffer with hexToBytes
             const key = hexToBytes(keyHex);
 
-            // Extract IV (first 16 bytes) and ciphertext
             const iv = encryptedData.slice(0, 16);
             const ciphertext = encryptedData.slice(16);
 
-            // Decrypt using Web Crypto API
             const cryptoKey = await window.crypto.subtle.importKey(
                 "raw",
                 key,
@@ -250,7 +267,6 @@ function Hospital() {
                 ciphertext
             );
 
-            // Create a Blob and trigger download
             const blob = new Blob([decrypted]);
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -319,21 +335,24 @@ function Hospital() {
                             <Table striped bordered hover size="sm">
                                 <thead>
                                     <tr>
-                                        <th>Patient Address</th>
+                                        <th>Patient</th>
                                         <th>Action</th>
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {patients.map((addr, idx) => (
-                                        <tr key={idx}>
-                                            <td>{addr}</td>
+                                    {patients.map((p) => (
+                                        <tr key={p.addr}>
+                                            <td>
+                                                {p.addr}<br/>
+                                                <small className="text-muted">{p.name}</small>
+                                            </td>
                                             <td>
                                                 <Button 
-                                                    variant={selectedPatient === addr ? "success" : "primary"}
+                                                    variant={selectedPatient === p.addr ? "success" : "primary"}
                                                     size="sm"
-                                                    onClick={() => setSelectedPatient(addr)}
+                                                    onClick={() => setSelectedPatient(p.addr)}
                                                 >
-                                                    {selectedPatient === addr ? "Selected" : "Select"}
+                                                    {selectedPatient === p.addr ? "Selected" : "Select"}
                                                 </Button>
                                             </td>
                                         </tr>
@@ -346,6 +365,24 @@ function Hospital() {
                     </Card.Body>
                 </Card>
 
+                {selectedPatient && (
+                    <Card className="card-custom mb-3">
+                        <Card.Body>
+                            <Card.Title>Selected Patient Details</Card.Title>
+                            {selectedPatientDetails ? (
+                                <div className="mb-3 p-3 border rounded bg-light">
+                                    <p><strong>Address:</strong> {selectedPatient}</p>
+                                    <p><strong>Name:</strong> {selectedPatientDetails.name}</p>
+                                    <p><strong>Age:</strong> {selectedPatientDetails.age}</p>
+                                    <p><strong>Gender:</strong> {selectedPatientDetails.gender}</p>
+                                </div>
+                            ) : (
+                                <Spinner size="sm" />
+                            )}
+                        </Card.Body>
+                    </Card>
+                )}
+
                 <Card className="card-custom">
                     <Card.Body>
                         <Card.Title>Upload Medical Record</Card.Title>
@@ -354,7 +391,7 @@ function Hospital() {
                                 <Form.Label>Selected Patient</Form.Label>
                                 <Form.Control
                                     type="text"
-                                    value={selectedPatient || "No patient selected"}
+                                    value={selectedPatient ? `${selectedPatient} (${selectedPatientDetails?.name || 'loading...'})` : "No patient selected"}
                                     readOnly
                                     plaintext
                                 />

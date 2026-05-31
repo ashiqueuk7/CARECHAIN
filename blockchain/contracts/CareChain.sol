@@ -2,12 +2,12 @@
 pragma solidity ^0.8.20;
 
 contract CareChain {
-    enum Role { None, Patient, Doctor, HospitalAdmin }
+    enum Role { None, Patient, Doctor, HospitalAdmin, Stakeholder }
 
     struct User {
         string name;
-        uint age;          // new
-        string gender;     // new
+        uint age;
+        string gender;
         Role role;
         uint hospitalId;
         bool registered;
@@ -30,7 +30,7 @@ contract CareChain {
     struct AccessLog {
         address accessor;
         uint recordId;
-        uint tier;         // 1=same hospital, 2=consent, 3=emergency
+        uint tier;
         uint time;
     }
 
@@ -41,25 +41,21 @@ contract CareChain {
     mapping(uint => Hospital) public hospitals;
     mapping(uint => Record) public records;
     mapping(address => uint[]) public patientRecords;
-    mapping(uint => address[]) public hospitalPatients;      // primary patients of hospital
+    mapping(uint => address[]) public hospitalPatients;
     mapping(uint => AccessLog[]) public accessLogs;
 
-    // Tier 2: explicit consent (given by patient)
     mapping(uint => mapping(address => bool)) public consentGiven;
-
-    // Tier 3: emergency access (time-limited)
     mapping(address => mapping(uint => uint)) public emergencyAccess;
-
-    // Consent requests (doctor → patient)
     mapping(uint => mapping(address => bool)) public consentRequested;
 
-    // Events
     event PatientRegistered(address indexed patient, string name, uint hospitalId);
     event HospitalRegistered(uint indexed hospitalId, string name, address admin);
     event DoctorRegistered(address indexed doctor, string name, uint hospitalId);
+    event StakeholderRegistered(address indexed stakeholder, string name);
     event RecordUploaded(uint indexed recordId, address indexed patient, uint hospitalId, string ipfsHash);
-    event ConsentRequested(uint indexed recordId, address indexed doctor);
-    event ConsentGiven(uint indexed recordId, address indexed doctor);
+    event ConsentRequested(uint indexed recordId, address indexed requester);
+    event ConsentGiven(uint indexed recordId, address indexed grantee);
+    event ConsentRevoked(uint indexed recordId, address indexed grantee);
     event EmergencyAccessGranted(address indexed doctor, uint indexed recordId, uint expiry);
     event AccessLogged(address indexed accessor, uint indexed recordId, uint tier, uint time);
 
@@ -88,6 +84,12 @@ contract CareChain {
         emit DoctorRegistered(msg.sender, _name, _hospitalId);
     }
 
+    function registerStakeholder(string memory _name) public {
+        require(!users[msg.sender].registered, "Already registered");
+        users[msg.sender] = User(_name, 0, "", Role.Stakeholder, 0, true);
+        emit StakeholderRegistered(msg.sender, _name);
+    }
+
     // ================= HOSPITAL UPLOAD =================
 
     function uploadRecord(address _patient, string memory _ipfsHash) public {
@@ -106,7 +108,6 @@ contract CareChain {
         patientRecords[_patient].push(recordCounter);
         emit RecordUploaded(recordCounter, _patient, hospitalId, _ipfsHash);
 
-        // Ensure patient appears in hospital's patient list
         bool alreadyInHospital = false;
         for (uint i = 0; i < hospitalPatients[hospitalId].length; i++) {
             if (hospitalPatients[hospitalId][i] == _patient) {
@@ -119,32 +120,95 @@ contract CareChain {
         }
     }
 
-    // ================= CONSENT REQUESTS (TIER 2) =================
+    // ================= ACCESS RECORD =================
+    //
+    // BUG FIX: The original used an else-if chain that caused cross-hospital
+    // doctors to be caught by the "role == Doctor" branch and then fail the
+    // same-hospital sub-check, making the emergency-access branch unreachable.
+    // Fix: evaluate each tier independently so all paths are always checked.
+    //
+    function accessRecord(uint _recordId) public returns (string memory ipfsHash, uint hospitalId, uint timestamp) {
+        Record memory r = records[_recordId];
+        require(r.id != 0, "Record does not exist");
+
+        uint tier;
+        bool authorized = false;
+
+        // Patient owns the record – no logging needed
+        if (msg.sender == r.patient) {
+            return (r.ipfsHash, r.hospitalId, r.timestamp);
+        }
+
+        // Tier 1 – same-hospital doctor or admin (evaluated independently)
+        if (!authorized &&
+            (users[msg.sender].role == Role.Doctor || users[msg.sender].role == Role.HospitalAdmin) &&
+            users[msg.sender].hospitalId == r.hospitalId)
+        {
+            authorized = true;
+            tier = 1;
+        }
+
+        // Tier 2 – explicit consent (any cross-institutional party: doctor or stakeholder)
+        if (!authorized && consentGiven[_recordId][msg.sender]) {
+            authorized = true;
+            tier = 2;
+        }
+
+        // Tier 3 – active emergency access (doctors only)
+        // This is now reachable even for cross-hospital doctors because the
+        // Tier 1 check above only sets authorized=true on a match.
+        if (!authorized && emergencyAccess[msg.sender][_recordId] > block.timestamp) {
+            authorized = true;
+            tier = 3;
+        }
+
+        require(authorized, "Not authorized to access this record");
+
+        accessLogs[_recordId].push(AccessLog(msg.sender, _recordId, tier, block.timestamp));
+        emit AccessLogged(msg.sender, _recordId, tier, block.timestamp);
+
+        return (r.ipfsHash, r.hospitalId, r.timestamp);
+    }
+
+    // ================= CONSENT =================
 
     function requestConsent(uint _recordId) public {
-        require(users[msg.sender].role == Role.Doctor, "Only doctors can request consent");
+        require(
+            users[msg.sender].role == Role.Doctor || users[msg.sender].role == Role.Stakeholder,
+            "Only doctors or stakeholders can request consent"
+        );
         Record memory r = records[_recordId];
         require(r.id != 0, "Record does not exist");
         require(!consentGiven[_recordId][msg.sender], "Consent already given");
-        require(emergencyAccess[msg.sender][_recordId] == 0, "Emergency access already active");
+        // FIX: use <= block.timestamp instead of == 0. After emergency access
+        // expires the slot holds a past timestamp (never 0 again), which would
+        // permanently block a subsequent consent request with the old check.
+        require(emergencyAccess[msg.sender][_recordId] <= block.timestamp, "Emergency access already active");
 
         consentRequested[_recordId][msg.sender] = true;
         emit ConsentRequested(_recordId, msg.sender);
     }
 
-    function giveConsent(uint _recordId, address _doctor) public {
+    function giveConsent(uint _recordId, address _grantee) public {
         require(records[_recordId].patient == msg.sender, "Only patient can give consent");
-        require(users[_doctor].role == Role.Doctor, "Consent can only be given to a doctor");
+        require(users[_grantee].registered, "Grantee must be registered");
 
-        consentGiven[_recordId][_doctor] = true;
-        delete consentRequested[_recordId][_doctor];
+        consentGiven[_recordId][_grantee] = true;
+        delete consentRequested[_recordId][_grantee];
 
-        accessLogs[_recordId].push(AccessLog(_doctor, _recordId, 2, block.timestamp));
-        emit ConsentGiven(_recordId, _doctor);
-        emit AccessLogged(_doctor, _recordId, 2, block.timestamp);
+        // Both doctors and stakeholders access via explicit consent = Tier 2
+        require(
+            users[_grantee].role == Role.Doctor || users[_grantee].role == Role.Stakeholder,
+            "Consent can only be given to doctors or stakeholders"
+        );
+        uint tier = 2;
+
+        accessLogs[_recordId].push(AccessLog(_grantee, _recordId, tier, block.timestamp));
+        emit ConsentGiven(_recordId, _grantee);
+        emit AccessLogged(_grantee, _recordId, tier, block.timestamp);
     }
 
-    // ================= EMERGENCY ACCESS (TIER 3) =================
+    // ================= EMERGENCY ACCESS (Tier 3) =================
 
     function requestEmergencyAccess(uint _recordId) public {
         require(users[msg.sender].role == Role.Doctor, "Only doctors can request emergency access");
@@ -165,26 +229,41 @@ contract CareChain {
         delete emergencyAccess[_doctor][_recordId];
     }
 
-    // ================= ACCESS CONTROL FOR RETRIEVING RECORD =================
+    // Tier 2: Patient revokes previously granted consent (doctors or stakeholders).
+    // consentGiven is set back to false so the grantee can no longer call
+    // accessRecord. A tier-5 log entry records the revocation for audit.
+    function revokeConsent(uint _recordId, address _grantee) public {
+        require(records[_recordId].patient == msg.sender, "Only patient can revoke consent");
+        require(consentGiven[_recordId][_grantee], "No active consent to revoke");
+
+        consentGiven[_recordId][_grantee] = false;
+
+        // tier 5 = consent revoked by patient
+        accessLogs[_recordId].push(AccessLog(msg.sender, _recordId, 5, block.timestamp));
+        emit ConsentRevoked(_recordId, _grantee);
+        emit AccessLogged(msg.sender, _recordId, 5, block.timestamp);
+    }
+
+    // ================= VIEW (no state change / no log) =================
 
     function getRecord(uint _recordId) public view returns (string memory ipfsHash, uint hospitalId, uint timestamp) {
         Record memory r = records[_recordId];
         require(r.id != 0, "Record does not exist");
 
-        bool authorized = false;
+        bool authorized = (msg.sender == r.patient);
 
-        if (msg.sender == r.patient) {
+        if (!authorized &&
+            (users[msg.sender].role == Role.Doctor || users[msg.sender].role == Role.HospitalAdmin) &&
+            users[msg.sender].hospitalId == r.hospitalId)
+        {
             authorized = true;
         }
-        else if (users[msg.sender].role == Role.Doctor || users[msg.sender].role == Role.HospitalAdmin) {
-            if (users[msg.sender].hospitalId == r.hospitalId) {
-                authorized = true;
-            }
-        }
-        else if (consentGiven[_recordId][msg.sender]) {
+
+        if (!authorized && consentGiven[_recordId][msg.sender]) {
             authorized = true;
         }
-        else if (emergencyAccess[msg.sender][_recordId] > block.timestamp) {
+
+        if (!authorized && emergencyAccess[msg.sender][_recordId] > block.timestamp) {
             authorized = true;
         }
 
@@ -192,7 +271,7 @@ contract CareChain {
         return (r.ipfsHash, r.hospitalId, r.timestamp);
     }
 
-    // ================= VIEW FUNCTIONS =================
+    // ================= GETTERS =================
 
     function getPatientRecords(address _patient) public view returns (uint[] memory) {
         return patientRecords[_patient];
