@@ -38,6 +38,19 @@ The system ensures that **patients remain in full control of their medical data*
 - **End-to-End Encryption (AES-256)**
 
 ---
+## 📸 Dashboard Screenshots
+
+### 🏥 Hospital Dashboard
+
+![Hospital Dashboard](ss/Hospital D.png)
+
+### 👤 Patient Dashboard
+
+![Patient Dashboard](ss/Patient%20D.png)
+
+### 👨‍⚕️ Doctor Dashboard
+
+![Doctor Dashboard](ss/Doctor%20D.png)
 
 ## 🏗️ System Architecture
 
