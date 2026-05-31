@@ -42,7 +42,7 @@ The system ensures that **patients remain in full control of their medical data*
 
 ### 🏥 Hospital Dashboard
 
-![Hospital Dashboard](ss/Hospital D.png)
+![Hospital Dashboard](ss/Hospital%20D.png)
 
 ### 👤 Patient Dashboard
 
